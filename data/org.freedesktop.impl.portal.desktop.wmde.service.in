@@ -1,0 +1,7 @@
+[Unit]
+Description=Portal service (WMDE implementation)
+
+[Service]
+Type=dbus
+BusName=org.freedesktop.impl.portal.desktop.wmde
+ExecStart=@libexecdir@/xdg-desktop-portal-wmde

@@ -1,5 +1,10 @@
+# Cargo package/binary name (kept as upstream so the embedded i18n domain still
+# resolves the xdg_desktop_portal_cosmic.ftl files).
 name := 'xdg-desktop-portal-cosmic'
-appid := 'org.freedesktop.impl.portal.desktop.cosmic'
+# Installed binary name and D-Bus identity, rebranded so this coexists with the
+# stock xdg-desktop-portal-cosmic package (distinct file names + bus name).
+bin-name := 'xdg-desktop-portal-wmde'
+appid := 'org.freedesktop.impl.portal.desktop.wmde'
 
 rootdir := ''
 prefix := '/usr'
@@ -26,7 +31,7 @@ vendor := '0'
 vendor-args := if vendor == '0' { '' } else { '--frozen' }
 
 bin-src := cargo-target-dir / target / name
-bin-dst := absolute_path(clean(rootdir / libexecdir)) / name
+bin-dst := absolute_path(clean(rootdir / libexecdir)) / bin-name
 
 [private]
 default: build
@@ -50,8 +55,8 @@ install:
         | install -Dm0644 /dev/stdin {{ data-dir }}/dbus-1/services/{{ appid }}.service
     sed 's|@libexecdir@|{{ libexecdir }}|' data/{{ appid }}.service.in \
         | install -Dm0644 /dev/stdin {{ lib-dir }}/systemd/user/{{ appid }}.service
-    install -Dm0644 data/cosmic.portal {{ data-dir }}/xdg-desktop-portal/portals/cosmic.portal
-    install -Dm0644 data/cosmic-portals.conf {{ data-dir }}/xdg-desktop-portal/cosmic-portals.conf
+    install -Dm0644 data/wmde.portal {{ data-dir }}/xdg-desktop-portal/portals/wmde.portal
+    install -Dm0644 data/wmde-portals.conf {{ data-dir }}/xdg-desktop-portal/wmde-portals.conf
     find 'data'/'icons' -type f -exec echo {} \; \
         | rev \
         | cut -d'/' -f-3 \

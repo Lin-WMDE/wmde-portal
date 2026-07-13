@@ -84,7 +84,7 @@ impl cosmic::Application for CosmicPortal {
 
     type Message = Msg;
 
-    const APP_ID: &'static str = "org.freedesktop.portal.desktop.cosmic";
+    const APP_ID: &'static str = "org.freedesktop.portal.desktop.wmde";
 
     fn core(&self) -> &app::Core {
         &self.core

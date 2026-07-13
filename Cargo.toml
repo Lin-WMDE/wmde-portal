@@ -80,13 +80,42 @@ serde = "1.0.228"
 gst = { package = "gstreamer", version = "0.25.1" }
 clap = { version = "4.6.1", features = ["derive"] }
 
-# [patch."https://github.com/pop-os/libcosmic"]
-# libcosmic = { git = "https://github.com/pop-os/libcosmic//", branch = "theme-v2" }
-# cosmic-config = { git = "https://github.com/pop-os/libcosmic//", branch = "theme-v2" }
-# iced_futures = { git = "https://github.com/pop-os/libcosmic//", branch = "theme-v2" }
-# libcosmic = { path = "../libcosmic" }
-# cosmic-config = { path = "../libcosmic/cosmic-config" }
-# cosmic-theme = { path = "../libcosmic/cosmic-theme" }
+# Build libcosmic/cosmic-config/cosmic-theme/iced from the local WMDE fork so the
+# rebranded config-root and fun.wmde.* ids resolve. The portal reads color-scheme +
+# accent through libcosmic TYPES (ThemeMode/CosmicTk/CosmicTheme), so building against
+# our libcosmic makes the Settings portal serve fun.wmde config automatically.
+[patch."https://github.com/pop-os/libcosmic"]
+libcosmic = { path = "../libcosmic" }
+cosmic-config = { path = "../libcosmic/cosmic-config" }
+cosmic-config-derive = { path = "../libcosmic/cosmic-config-derive" }
+cosmic-theme = { path = "../libcosmic/cosmic-theme" }
+iced = { path = "../libcosmic/iced" }
+iced_accessibility = { path = "../libcosmic/iced/accessibility" }
+iced_core = { path = "../libcosmic/iced/core" }
+iced_debug = { path = "../libcosmic/iced/debug" }
+iced_futures = { path = "../libcosmic/iced/futures" }
+iced_graphics = { path = "../libcosmic/iced/graphics" }
+iced_program = { path = "../libcosmic/iced/program" }
+iced_renderer = { path = "../libcosmic/iced/renderer" }
+iced_runtime = { path = "../libcosmic/iced/runtime" }
+iced_tiny_skia = { path = "../libcosmic/iced/tiny_skia" }
+iced_wgpu = { path = "../libcosmic/iced/wgpu" }
+iced_widget = { path = "../libcosmic/iced/widget" }
+iced_winit = { path = "../libcosmic/iced/winit" }
+
+# Some transitive deps pin libcosmic/cosmic-config via the trailing-slash and .git URL
+# variants; patch those too so a single (local) libcosmic resolves across the graph.
+[patch."https://github.com/pop-os/libcosmic/"]
+libcosmic = { path = "../libcosmic" }
+cosmic-config = { path = "../libcosmic/cosmic-config" }
+cosmic-config-derive = { path = "../libcosmic/cosmic-config-derive" }
+cosmic-theme = { path = "../libcosmic/cosmic-theme" }
+
+[patch."https://github.com/pop-os/libcosmic.git"]
+libcosmic = { path = "../libcosmic" }
+cosmic-config = { path = "../libcosmic/cosmic-config" }
+cosmic-config-derive = { path = "../libcosmic/cosmic-config-derive" }
+cosmic-theme = { path = "../libcosmic/cosmic-theme" }
 
 [profile.release]
 opt-level = 3
