@@ -265,13 +265,23 @@ impl WaylandHelper {
             toplevel_info_state: ToplevelInfoState::new(&registry_state, &qh),
             registry_state,
         };
-        event_queue.flush().unwrap();
+        // On headless/software-rendering setups (e.g. a VM with no real GPU) the
+        // wayland features used by ScreenCast/Screenshot may be unavailable. Keep
+        // init non-fatal so the portal (and its Settings interface) still starts.
+        if let Err(err) = event_queue.flush() {
+            log::warn!("wayland event queue flush failed: {}", err);
+        }
 
-        event_queue.roundtrip(&mut data).unwrap();
+        if let Err(err) = event_queue.roundtrip(&mut data) {
+            log::warn!("wayland event queue roundtrip failed: {}", err);
+        }
 
         thread::spawn(move || {
             loop {
-                event_queue.blocking_dispatch(&mut data).unwrap();
+                if let Err(err) = event_queue.blocking_dispatch(&mut data) {
+                    log::error!("wayland event dispatch failed, stopping event loop: {}", err);
+                    break;
+                }
             }
         });
 
