@@ -22,7 +22,10 @@ cosmic-protocols = { git = "https://github.com/pop-os/cosmic-protocols", rev = "
 cosmic-client-toolkit = { git = "https://github.com/pop-os/cosmic-protocols", rev = "32283d7" }
 futures = "0.3"
 image = "0.25"
-cosmic-bg-config = { git = "https://github.com/pop-os/cosmic-bg" }
+# wmde-bg renamed its config crate to `wmde-bg-config` (ships the `fun.wmde.Background`
+# id); alias it back to the `cosmic-bg-config` key so `cosmic_bg_config::` imports keep
+# resolving, and so the portal reads the same wallpaper state the wmde-bg daemon writes.
+cosmic-bg-config = { package = "wmde-bg-config", path = "../wmde-bg/config" }
 cosmic-portal-config = { path = "./cosmic-portal-config" }
 memmap2 = "0.9.10"
 # pipewire = { git = "https://github.com/pop-os/pipewire-rs" }
