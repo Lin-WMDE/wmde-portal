@@ -925,7 +925,7 @@ pub fn update_args(
             let source = bg_state.wallpapers.iter().find(|s| s.0 == o.name);
             o.bg_source = Some(source.cloned().map(|s| s.1).unwrap_or_else(|| {
                 cosmic_bg_config::Source::Path(
-                    "/usr/share/backgrounds/cosmic/orion_nebula_nasa_heic0601a.jpg".into(),
+                    "/usr/share/backgrounds/wmde/wmde-default.jpg".into(),
                 )
             }));
         }
@@ -933,7 +933,7 @@ pub fn update_args(
         log::error!("Failed to get bg config state");
         for o in &mut portal.outputs {
             o.bg_source = Some(cosmic_bg_config::Source::Path(
-                "/usr/share/backgrounds/cosmic/orion_nebula_nasa_heic0601a.jpg".into(),
+                "/usr/share/backgrounds/wmde/wmde-default.jpg".into(),
             ));
         }
     }
