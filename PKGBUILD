@@ -60,7 +60,7 @@ package() {
   # The Cargo package/binary name stays upstream (xdg-desktop-portal-cosmic) so the
   # embedded i18n domain resolves; install it under a distinct name to coexist with
   # the stock package's /usr/libexec/xdg-desktop-portal-cosmic.
-  install -Dm755 target/release/xdg-desktop-portal-cosmic \
+  install -Dm755 "${CARGO_TARGET_DIR:-target}/release/xdg-desktop-portal-cosmic" \
     "$pkgdir/usr/libexec/xdg-desktop-portal-wmde"
 
   # Portal backend descriptor (Settings/Access/FileChooser/Screenshot/ScreenCast).
