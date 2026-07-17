@@ -21,6 +21,7 @@ cosmic-files = { git = "https://github.com/pop-os/cosmic-files", default-feature
 cosmic-protocols = { git = "https://github.com/pop-os/cosmic-protocols", rev = "32283d7" }
 cosmic-client-toolkit = { git = "https://github.com/pop-os/cosmic-protocols", rev = "32283d7" }
 futures = "0.3"
+async-io = "2" # runtime-agnostic Timer for capture timeouts (works under tokio and block_on)
 image = "0.25"
 # wmde-bg renamed its config crate to `wmde-bg-config` (ships the `fun.wmde.Background`
 # id); alias it back to the `cosmic-bg-config` key so `cosmic_bg_config::` imports keep

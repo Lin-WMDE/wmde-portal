@@ -12,12 +12,18 @@ use cosmic_client_toolkit::sctk::shm::{Shm, ShmHandler};
 use cosmic_client_toolkit::sctk::{self};
 use cosmic_client_toolkit::toplevel_info::{ToplevelInfo, ToplevelInfoState};
 use cosmic_client_toolkit::workspace::WorkspaceState;
+use async_io::Timer;
 use futures::channel::oneshot;
+use futures::future::{Either, select};
 use futures::stream::{FuturesOrdered, Stream, StreamExt};
 use std::collections::HashMap;
+use std::future::Future;
 use std::os::fd::{AsFd, OwnedFd};
+use std::pin::pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::thread;
+use std::time::Duration;
 use wayland_client::globals::registry_queue_init;
 use wayland_client::protocol::{wl_buffer, wl_output, wl_shm, wl_shm_pool};
 use wayland_client::{Connection, Dispatch, QueueHandle, WEnum};
@@ -36,6 +42,25 @@ use crate::buffer;
 mod gbm_devices;
 mod toplevel;
 mod workspaces;
+
+/// Upper bound on how long a single capture step (waiting for `Formats`, or for a
+/// captured frame) may block. A healthy capture completes in well under a second;
+/// reaching this means the wayland dispatch loop stalled or died, and we return an
+/// error instead of hanging the portal request (and its D-Bus caller) forever.
+const CAPTURE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Run `fut`, or return `None` if `CAPTURE_TIMEOUT` elapses first. Uses async-io's
+/// timer, which drives itself off its own reactor, so this works under any executor
+/// (tokio for the Screenshot path, `futures::executor::block_on` for the ScreenCast
+/// thread).
+async fn with_timeout<T>(fut: impl Future<Output = T>) -> Option<T> {
+    let fut = pin!(fut);
+    let timer = pin!(Timer::after(CAPTURE_TIMEOUT));
+    match select(fut, timer).await {
+        Either::Left((out, _)) => Some(out),
+        Either::Right(_) => None,
+    }
+}
 
 #[derive(Clone)]
 pub struct DmabufHelper {
@@ -82,12 +107,28 @@ struct WaylandHelperInner {
     wl_shm: wl_shm::WlShm,
     dmabuf: Mutex<Option<DmabufHelper>>,
     zwp_dmabuf: Option<ZwpLinuxDmabufV1>,
+    /// `false` once the dispatch thread has exited (see `WaylandHelper::new`); capture
+    /// entry points check this to fail fast instead of awaiting events that will never
+    /// be dispatched.
+    event_loop_alive: AtomicBool,
 }
 
 // TODO seperate state object from what is passed to threads
 #[derive(Clone)]
 pub struct WaylandHelper {
     inner: Arc<WaylandHelperInner>,
+}
+
+/// Clears `event_loop_alive` when dropped, so the flag is reset whether the dispatch
+/// thread exits cleanly (a dispatch error) or a wayland event handler panics and
+/// unwinds the thread. Holds its own `WaylandHelper` clone so it can still reach the
+/// flag even after the thread's `AppData` has been dropped.
+struct EventLoopGuard(WaylandHelper);
+
+impl Drop for EventLoopGuard {
+    fn drop(&mut self) {
+        self.0.inner.event_loop_alive.store(false, Ordering::SeqCst);
+    }
 }
 
 struct AppData {
@@ -181,7 +222,7 @@ impl Session {
     /// If formats has not been sent, this will wait until it is received. It returns
     /// `None` if the server has sent `stopped`.
     pub async fn wait_for_formats<T, F: FnMut(&Formats) -> T>(&self, mut cb: F) -> Option<T> {
-        std::future::poll_fn(|context| {
+        let wait = std::future::poll_fn(|context| {
             let mut state = self.0.state.lock().unwrap();
             if state.stopped {
                 std::task::Poll::Ready(None)
@@ -191,8 +232,16 @@ impl Session {
                 state.wakers.push(context.waker().clone());
                 std::task::Poll::Pending
             }
-        })
-        .await
+        });
+        // Bound the wait: if the event loop stalls or dies, `Formats` never arrives and
+        // the waker is never woken - without this the caller would hang forever.
+        match with_timeout(wait).await {
+            Some(result) => result,
+            None => {
+                log::error!("timed out waiting for capture formats (wayland event loop stalled?)");
+                None
+            }
+        }
     }
 
     /// Capture to `wl_buffer`, blocking until capture either succeeds or fails
@@ -212,15 +261,24 @@ impl Session {
                 sender: Mutex::new(Some(sender)),
             },
         );
-        self.0.wayland_helper.inner.conn.flush().unwrap();
+        if let Err(err) = self.0.wayland_helper.inner.conn.flush() {
+            log::error!("wayland flush failed while requesting capture: {}", err);
+            return Err(WEnum::Value(FailureReason::Stopped));
+        }
 
         // TODO: wait for server to release buffer?
         // Assume stopped if frame is dropped without `ready` or `failed`
         // - This can happen if the session object has already been destroyed
         //   when the frame is created.
-        receiver
-            .await
-            .unwrap_or(Err(WEnum::Value(FailureReason::Stopped)))
+        // Bounded wait: a dead event loop would otherwise leave `receiver` pending
+        // forever, since its sender is only fired from the dispatch thread.
+        match with_timeout(receiver).await {
+            Some(result) => result.unwrap_or(Err(WEnum::Value(FailureReason::Stopped))),
+            None => {
+                log::error!("timed out waiting for captured frame (wayland event loop stalled?)");
+                Err(WEnum::Value(FailureReason::Stopped))
+            }
+        }
     }
 
     pub fn is_stopped(&self) -> bool {
@@ -230,12 +288,18 @@ impl Session {
 
 impl WaylandHelper {
     pub fn new(conn: wayland_client::Connection) -> Self {
-        // XXX unwrap
-        let (globals, mut event_queue) = registry_queue_init(&conn).unwrap();
+        // Fatal on purpose: the portal is D-Bus activated inside a running wayland
+        // session, so a failure here means a broken/absent compositor socket. Use a
+        // diagnostic panic rather than a bare unwrap. (Serving the Settings interface
+        // headless - without wayland - would require decoupling the zbus server from
+        // the iced app; tracked separately.)
+        let (globals, mut event_queue) = registry_queue_init(&conn)
+            .expect("wayland registry init failed - portal requires a running wayland compositor");
         let qh = event_queue.handle();
         let registry_state = RegistryState::new(&globals);
         let screencopy_state = ScreencopyState::new(&globals, &qh);
-        let shm_state = Shm::bind(&globals, &qh).unwrap();
+        let shm_state =
+            Shm::bind(&globals, &qh).expect("wl_shm unavailable - required for capture buffers");
         let zwp_dmabuf = globals.bind(&qh, 4..=4, sctk::globals::GlobalData).ok();
         let wayland_helper = WaylandHelper {
             inner: Arc::new(WaylandHelperInner {
@@ -249,6 +313,7 @@ impl WaylandHelper {
                 wl_shm: shm_state.wl_shm().clone(),
                 dmabuf: Mutex::new(None),
                 zwp_dmabuf,
+                event_loop_alive: AtomicBool::new(true),
             }),
         };
         let dmabuf_state = DmabufState::new(&globals, &qh);
@@ -265,18 +330,26 @@ impl WaylandHelper {
             toplevel_info_state: ToplevelInfoState::new(&registry_state, &qh),
             registry_state,
         };
-        // On headless/software-rendering setups (e.g. a VM with no real GPU) the
-        // wayland features used by ScreenCast/Screenshot may be unavailable. Keep
-        // init non-fatal so the portal (and its Settings interface) still starts.
+        // A flush/roundtrip error here is a real transport or protocol failure on the
+        // wayland connection - wl_shm and the screencopy globals exist regardless of
+        // GPU/software-rendering, so this is NOT a normal headless condition. It is not
+        // worth aborting startup over (the Settings interface needs no wayland, and a
+        // later capture attempt surfaces the failure via CAPTURE_TIMEOUT), but log it
+        // honestly as a connection/protocol error.
         if let Err(err) = event_queue.flush() {
-            log::warn!("wayland event queue flush failed: {}", err);
+            log::warn!("initial wayland flush failed (connection/protocol error): {}", err);
         }
 
         if let Err(err) = event_queue.roundtrip(&mut data) {
-            log::warn!("wayland event queue roundtrip failed: {}", err);
+            log::warn!("initial wayland roundtrip failed (connection/protocol error): {}", err);
         }
 
         thread::spawn(move || {
+            // Mark the event loop dead on ANY exit - a clean dispatch-error break OR a
+            // handler panic unwinding the thread - so capture entry points fail fast
+            // instead of awaiting frames that will never arrive. Dropping `data`/
+            // `event_queue` on the way out also cancels any in-flight frame senders.
+            let _guard = EventLoopGuard(data.wayland_helper.clone());
             loop {
                 if let Err(err) = event_queue.blocking_dispatch(&mut data) {
                     log::error!("wayland event dispatch failed, stopping event loop: {}", err);
@@ -286,6 +359,13 @@ impl WaylandHelper {
         });
 
         wayland_helper
+    }
+
+    /// Whether the wayland dispatch thread is still running. Once it exits (an
+    /// unrecoverable dispatch error) no further wayland events are processed, so
+    /// captures must not be attempted.
+    pub fn is_event_loop_alive(&self) -> bool {
+        self.inner.event_loop_alive.load(Ordering::SeqCst)
     }
 
     pub fn dmabuf(&self) -> Option<DmabufHelper> {
@@ -377,7 +457,9 @@ impl WaylandHelper {
                 )
                 .unwrap();
 
-            self.inner.conn.flush().unwrap();
+            if let Err(err) = self.inner.conn.flush() {
+                log::warn!("wayland flush failed while creating capture session: {}", err);
+            }
 
             SessionInner {
                 wayland_helper: self.clone(),
@@ -395,6 +477,13 @@ impl WaylandHelper {
     ) -> Option<ShmImage<OwnedFd>> {
         // XXX error type?
         // TODO: way to get cursor metadata?
+
+        // Fail fast if the event loop is already dead - no point setting up a capture
+        // whose frames will never be dispatched.
+        if !self.is_event_loop_alive() {
+            log::error!("wayland event loop is not running; cannot capture output");
+            return None;
+        }
 
         let session = self.capture_source_session(source, overlay_cursor);
 
@@ -589,8 +678,13 @@ impl OutputHandler for AppData {
         self.wayland_helper.set_output_info(&output, None);
 
         let mut outputs = self.wayland_helper.inner.outputs.lock().unwrap();
-        let idx = outputs.iter().position(|x| x == &output).unwrap();
-        outputs.remove(idx);
+        if let Some(idx) = outputs.iter().position(|x| x == &output) {
+            outputs.remove(idx);
+        } else {
+            // Protocol edge case: destroyed an output we were not tracking. Skip rather
+            // than panic (a panic here would kill the whole dispatch thread).
+            log::warn!("output_destroyed for an untracked output; ignoring");
+        }
         self.update_output_toplevels();
     }
 }
