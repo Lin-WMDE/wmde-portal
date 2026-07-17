@@ -14,7 +14,8 @@ members = ["cosmic-portal-config"]
 [dependencies]
 anyhow = "1.0.102"
 ashpd = "0.12"
-cosmic-files = { git = "https://github.com/pop-os/cosmic-files", default-features = false, features = [
+# WMDE: use our forked file manager's file-chooser dialog instead of pop-os/cosmic-files.
+cosmic-files = { package = "wmde-files", path = "../wmde-files", default-features = false, features = [
     "gvfs",
     "wayland",
 ] }
