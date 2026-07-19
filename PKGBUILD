@@ -6,7 +6,7 @@
 # accent live. Built against ../libcosmic (fun.wmde config ids). Coexists with the
 # stock xdg-desktop-portal-cosmic: distinct D-Bus name + distinct installed file names.
 pkgname=wmde-portal
-pkgver=0.1.0
+pkgver=1.3.0
 pkgrel=1
 pkgdesc="WMDE XDG desktop portal (fork of xdg-desktop-portal-cosmic; fun.wmde Settings backend)"
 arch=('x86_64')
@@ -31,14 +31,13 @@ sha256sums=('SKIP')
 
 pkgver() {
   cd "$srcdir/$pkgname"
-  # No tags on this fork yet, so fall back to the r<count>.g<short> scheme. Guard on
-  # git describe's own exit status (a pipe to sed would swallow it and yield empty).
+  # WMDE unified version: 1.3 (libcosmic base) . <commits since nearest tag> . g<short>.
   local desc
   desc=$(git describe --long --tags --abbrev=7 2>/dev/null || true)
   if [ -n "$desc" ]; then
-    printf '%s' "$desc" | sed 's/^epoch-//;s/^v//;s/\([^-]*-g\)/r\1/;s/-/./g'
+    printf '1.3.%s.g%s' "$(printf '%s' "$desc" | sed -E 's/.*-([0-9]+)-g[0-9a-f]+$/\1/')" "$(git rev-parse --short=7 HEAD)"
   else
-    printf '0.1.0.r%s.g%s' "$(git rev-list --count HEAD)" "$(git rev-parse --short=7 HEAD)"
+    printf '1.3.%s.g%s' "$(git rev-list --count HEAD)" "$(git rev-parse --short=7 HEAD)"
   fi
 }
 
