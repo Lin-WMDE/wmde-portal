@@ -7,7 +7,7 @@
 # stock xdg-desktop-portal-cosmic: distinct D-Bus name + distinct installed file names.
 pkgname=wmde-portal
 pkgver=1.3.0
-pkgrel=1
+pkgrel=2
 pkgdesc="WMDE XDG desktop portal (fork of xdg-desktop-portal-cosmic; fun.wmde Settings backend)"
 arch=('x86_64')
 url="https://wmde.fun"
