@@ -1,3 +1,4 @@
 [D-BUS Service]
 Name=org.freedesktop.impl.portal.desktop.wmde
 Exec=@libexecdir@/xdg-desktop-portal-wmde
+SystemdService=org.freedesktop.impl.portal.desktop.wmde.service

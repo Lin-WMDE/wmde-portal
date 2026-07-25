@@ -142,6 +142,13 @@ struct AppData {
     workspace_state: WorkspaceState,
 }
 
+// NOTE: upstream (pop-os 969f3ca) adds a `Drop` impl for `AppData` here that calls
+// `process::exit(1)` when the dispatch thread unwinds, relying on the service being
+// restarted. WMDE deliberately does NOT take it: our systemd user unit has no
+// `Restart=`, so exiting would take the portal down for the whole session instead of
+// degrading. `EventLoopGuard` + `event_loop_alive` above already mark the loop dead so
+// capture entry points fail fast while Settings/Access keep working.
+
 impl AppData {
     pub fn update_output_toplevels(&self) {
         let toplevels = self.toplevel_info_state.toplevels();
@@ -238,7 +245,9 @@ impl Session {
         match with_timeout(wait).await {
             Some(result) => result,
             None => {
-                log::error!("timed out waiting for capture formats (wayland event loop stalled?)");
+                tracing::error!(
+                    "timed out waiting for capture formats (wayland event loop stalled?)"
+                );
                 None
             }
         }
@@ -262,7 +271,7 @@ impl Session {
             },
         );
         if let Err(err) = self.0.wayland_helper.inner.conn.flush() {
-            log::error!("wayland flush failed while requesting capture: {}", err);
+            tracing::error!("wayland flush failed while requesting capture: {}", err);
             return Err(WEnum::Value(FailureReason::Stopped));
         }
 
@@ -275,7 +284,9 @@ impl Session {
         match with_timeout(receiver).await {
             Some(result) => result.unwrap_or(Err(WEnum::Value(FailureReason::Stopped))),
             None => {
-                log::error!("timed out waiting for captured frame (wayland event loop stalled?)");
+                tracing::error!(
+                    "timed out waiting for captured frame (wayland event loop stalled?)"
+                );
                 Err(WEnum::Value(FailureReason::Stopped))
             }
         }
@@ -337,11 +348,11 @@ impl WaylandHelper {
         // later capture attempt surfaces the failure via CAPTURE_TIMEOUT), but log it
         // honestly as a connection/protocol error.
         if let Err(err) = event_queue.flush() {
-            log::warn!("initial wayland flush failed (connection/protocol error): {}", err);
+            tracing::warn!("initial wayland flush failed (connection/protocol error): {}", err);
         }
 
         if let Err(err) = event_queue.roundtrip(&mut data) {
-            log::warn!("initial wayland roundtrip failed (connection/protocol error): {}", err);
+            tracing::warn!("initial wayland roundtrip failed (connection/protocol error): {}", err);
         }
 
         thread::spawn(move || {
@@ -352,7 +363,7 @@ impl WaylandHelper {
             let _guard = EventLoopGuard(data.wayland_helper.clone());
             loop {
                 if let Err(err) = event_queue.blocking_dispatch(&mut data) {
-                    log::error!("wayland event dispatch failed, stopping event loop: {}", err);
+                    tracing::error!("wayland event dispatch failed, stopping event loop: {}", err);
                     break;
                 }
             }
@@ -458,7 +469,7 @@ impl WaylandHelper {
                 .unwrap();
 
             if let Err(err) = self.inner.conn.flush() {
-                log::warn!("wayland flush failed while creating capture session: {}", err);
+                tracing::warn!("wayland flush failed while creating capture session: {}", err);
             }
 
             SessionInner {
@@ -481,7 +492,7 @@ impl WaylandHelper {
         // Fail fast if the event loop is already dead - no point setting up a capture
         // whose frames will never be dispatched.
         if !self.is_event_loop_alive() {
-            log::error!("wayland event loop is not running; cannot capture output");
+            tracing::error!("wayland event loop is not running; cannot capture output");
             return None;
         }
 
@@ -683,7 +694,7 @@ impl OutputHandler for AppData {
         } else {
             // Protocol edge case: destroyed an output we were not tracking. Skip rather
             // than panic (a panic here would kill the whole dispatch thread).
-            log::warn!("output_destroyed for an untracked output; ignoring");
+            tracing::warn!("output_destroyed for an untracked output; ignoring");
         }
         self.update_output_toplevels();
     }
