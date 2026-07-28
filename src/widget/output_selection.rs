@@ -84,6 +84,10 @@ impl<Msg: Clone + 'static> Widget<Msg, cosmic::Theme, cosmic::Renderer> for Outp
                     width: 4.0,
                     color: accent,
                 },
+                // WMDE: the outer ring above is snapped; these two share the same bounds, so
+                // leaving this one unsnapped rounded them to different pixel edges and the inner
+                // ring lost the outer one's edge.
+                snap: true,
                 ..Default::default()
             },
             Background::Color(Color::TRANSPARENT),

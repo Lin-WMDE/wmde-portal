@@ -185,6 +185,11 @@ where
                                         ))
                                     }
                                 }),
+                                // WMDE: this stands in for the wallpaper on a fullscreen overlay
+                                // layer surface, with the real desktop behind it. An unsnapped
+                                // edge leaves the last row or column only partly covered, and
+                                // the desktop bleeds through at the screen edge.
+                                snap: true,
                                 ..Default::default()
                             }
                         })))
