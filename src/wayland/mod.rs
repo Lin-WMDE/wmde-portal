@@ -1,5 +1,6 @@
 use cosmic_client_toolkit::screencopy::{
-    CaptureFrame, CaptureOptions, CaptureSession, Capturer, FailureReason, Formats, Frame,
+    CaptureCursorSession, CaptureFrame, CaptureOptions, CaptureSession, Capturer, FailureReason,
+    Formats, Frame, ScreencopyCursorSessionData, ScreencopyCursorSessionDataExt,
     ScreencopyFrameData, ScreencopyFrameDataExt, ScreencopyHandler, ScreencopySessionData,
     ScreencopySessionDataExt, ScreencopyState,
 };
@@ -8,6 +9,8 @@ use cosmic_client_toolkit::sctk::dmabuf::{
 };
 use cosmic_client_toolkit::sctk::output::{OutputHandler, OutputInfo, OutputState};
 use cosmic_client_toolkit::sctk::registry::{ProvidesRegistryState, RegistryState};
+use cosmic_client_toolkit::sctk::seat::pointer::{PointerEvent, PointerHandler};
+use cosmic_client_toolkit::sctk::seat::{self, SeatHandler, SeatState};
 use cosmic_client_toolkit::sctk::shm::{Shm, ShmHandler};
 use cosmic_client_toolkit::sctk::{self};
 use cosmic_client_toolkit::toplevel_info::{ToplevelInfo, ToplevelInfoState};
@@ -20,12 +23,12 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::os::fd::{AsFd, OwnedFd};
 use std::pin::pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::thread;
 use std::time::Duration;
 use wayland_client::globals::registry_queue_init;
-use wayland_client::protocol::{wl_buffer, wl_output, wl_shm, wl_shm_pool};
+use wayland_client::protocol::{wl_buffer, wl_output, wl_pointer, wl_seat, wl_shm, wl_shm_pool};
 use wayland_client::{Connection, Dispatch, QueueHandle, WEnum};
 use wayland_protocols::ext::foreign_toplevel_list::v1::client::ext_foreign_toplevel_handle_v1::ExtForeignToplevelHandleV1;
 use wayland_protocols::ext::workspace::v1::client::ext_workspace_handle_v1;
@@ -39,6 +42,8 @@ pub use cosmic_client_toolkit::screencopy::{CaptureSource, Rect};
 
 use crate::buffer;
 
+mod cursor_stream;
+pub use cursor_stream::{CursorFrame, CursorStream};
 mod gbm_devices;
 mod toplevel;
 mod workspaces;
@@ -59,6 +64,22 @@ async fn with_timeout<T>(fut: impl Future<Output = T>) -> Option<T> {
     match select(fut, timer).await {
         Either::Left((out, _)) => Some(out),
         Either::Right(_) => None,
+    }
+}
+
+fn wl_transform_to_image_orientation(
+    transform: wl_output::Transform,
+) -> image::metadata::Orientation {
+    match transform {
+        wl_output::Transform::Normal => image::metadata::Orientation::NoTransforms,
+        wl_output::Transform::_90 => image::metadata::Orientation::Rotate90,
+        wl_output::Transform::_180 => image::metadata::Orientation::Rotate180,
+        wl_output::Transform::_270 => image::metadata::Orientation::Rotate270,
+        wl_output::Transform::Flipped => image::metadata::Orientation::FlipHorizontal,
+        wl_output::Transform::Flipped90 => image::metadata::Orientation::Rotate90FlipH,
+        wl_output::Transform::Flipped180 => image::metadata::Orientation::FlipVertical,
+        wl_output::Transform::Flipped270 => image::metadata::Orientation::Rotate270FlipH,
+        _ => unreachable!(),
     }
 }
 
@@ -111,9 +132,10 @@ struct WaylandHelperInner {
     /// entry points check this to fail fast instead of awaiting events that will never
     /// be dispatched.
     event_loop_alive: AtomicBool,
+    // TODO: Handle multiple pointers if multi-seat is ever supported.
+    pointer: Mutex<Option<(wl_seat::WlSeat, wl_pointer::WlPointer)>>,
 }
 
-// TODO seperate state object from what is passed to threads
 #[derive(Clone)]
 pub struct WaylandHelper {
     inner: Arc<WaylandHelperInner>,
@@ -132,7 +154,7 @@ impl Drop for EventLoopGuard {
 }
 
 struct AppData {
-    wayland_helper: WaylandHelper, // TODO: populate outputs
+    wayland_helper: WaylandHelper,
     registry_state: RegistryState,
     screencopy_state: ScreencopyState,
     output_state: OutputState,
@@ -140,6 +162,7 @@ struct AppData {
     dmabuf_state: DmabufState,
     toplevel_info_state: ToplevelInfoState,
     workspace_state: WorkspaceState,
+    seat_state: SeatState,
 }
 
 // NOTE: upstream (pop-os 969f3ca) adds a `Drop` impl for `AppData` here that calls
@@ -148,6 +171,8 @@ struct AppData {
 // `Restart=`, so exiting would take the portal down for the whole session instead of
 // degrading. `EventLoopGuard` + `event_loop_alive` above already mark the loop dead so
 // capture entry points fail fast while Settings/Access keep working.
+// Still applies as of the COSMIC 1.5 merge: upstream 1.5 leaves that `Drop` impl
+// unchanged, so our removal of it stands.
 
 impl AppData {
     pub fn update_output_toplevels(&self) {
@@ -260,7 +285,6 @@ impl Session {
         buffer_damage: &[Rect],
     ) -> Result<Frame, WEnum<FailureReason>> {
         let (sender, receiver) = oneshot::channel();
-        // TODO damage
         self.0.capture_session.capture(
             buffer,
             buffer_damage,
@@ -297,6 +321,37 @@ impl Session {
     }
 }
 
+struct CursorSessionInner {
+    capture_session: CaptureSession,
+    _capture_cursor_session: CaptureCursorSession,
+    cursor_entered: AtomicBool,
+    // Pack x and y into a single atomic
+    cursor_position: AtomicU64,
+    cursor_hotspot: AtomicU64,
+}
+
+pub struct CursorSession(Arc<CursorSessionInner>);
+
+impl CursorSession {
+    pub fn cursor_entered(&self) -> bool {
+        self.0.cursor_entered.load(Ordering::Relaxed)
+    }
+
+    pub fn cursor_position(&self) -> (i32, i32) {
+        let value = self.0.cursor_position.load(Ordering::Relaxed).to_ne_bytes();
+        let x = i32::from_ne_bytes(value[..4].try_into().unwrap());
+        let y = i32::from_ne_bytes(value[4..].try_into().unwrap());
+        (x, y)
+    }
+
+    fn cursor_hotspot(&self) -> (i32, i32) {
+        let value = self.0.cursor_hotspot.load(Ordering::Relaxed).to_ne_bytes();
+        let x = i32::from_ne_bytes(value[..4].try_into().unwrap());
+        let y = i32::from_ne_bytes(value[4..].try_into().unwrap());
+        (x, y)
+    }
+}
+
 impl WaylandHelper {
     pub fn new(conn: wayland_client::Connection) -> Self {
         // Fatal on purpose: the portal is D-Bus activated inside a running wayland
@@ -325,6 +380,7 @@ impl WaylandHelper {
                 dmabuf: Mutex::new(None),
                 zwp_dmabuf,
                 event_loop_alive: AtomicBool::new(true),
+                pointer: Mutex::new(None),
             }),
         };
         let dmabuf_state = DmabufState::new(&globals, &qh);
@@ -340,6 +396,7 @@ impl WaylandHelper {
             workspace_state: WorkspaceState::new(&registry_state, &qh),
             toplevel_info_state: ToplevelInfoState::new(&registry_state, &qh),
             registry_state,
+            seat_state: SeatState::new(&globals, &qh),
         };
         // A flush/roundtrip error here is a real transport or protocol failure on the
         // wayland connection - wl_shm and the screencopy globals exist regardless of
@@ -487,7 +544,6 @@ impl WaylandHelper {
         overlay_cursor: bool,
     ) -> Option<ShmImage<OwnedFd>> {
         // XXX error type?
-        // TODO: way to get cursor metadata?
 
         // Fail fast if the event loop is already dead - no point setting up a capture
         // whose frames will never be dispatched.
@@ -530,6 +586,57 @@ impl WaylandHelper {
         } else {
             None
         }
+    }
+
+    pub fn capture_source_cursor_session(
+        &self,
+        source: CaptureSource,
+    ) -> Option<(CursorSession, cursor_stream::CursorStream)> {
+        let pointer = self.inner.pointer.lock().unwrap();
+        let (_, pointer) = pointer.as_ref()?;
+
+        let cursor_session = CursorSession(Arc::new_cyclic(|weak_session| {
+            let capture_cursor_session = self
+                .inner
+                .capturer
+                .create_cursor_session(
+                    &source,
+                    pointer,
+                    &self.inner.qh,
+                    CursorSessionData {
+                        session: weak_session.clone(),
+                        session_data: ScreencopyCursorSessionData::default(),
+                    },
+                )
+                .unwrap();
+
+            let capture_session = capture_cursor_session
+                .capture_session(
+                    &self.inner.qh,
+                    CursorCaptureSessionData {
+                        session_data: ScreencopySessionData::default(),
+                        waker: Mutex::new(None),
+                        formats: Mutex::new(None),
+                    },
+                )
+                .unwrap();
+
+            CursorSessionInner {
+                capture_session,
+                _capture_cursor_session: capture_cursor_session,
+                cursor_entered: AtomicBool::new(false),
+                cursor_position: AtomicU64::new(0),
+                cursor_hotspot: AtomicU64::new(0),
+            }
+        }));
+
+        let cursor_stream = cursor_stream::CursorStream::new(
+            &cursor_session,
+            &cursor_session.0.capture_session,
+            self,
+        );
+
+        Some((cursor_session, cursor_stream))
     }
 
     pub fn create_shm_buffer<Fd: AsFd>(
@@ -612,17 +719,7 @@ impl<T: AsFd> ShmImage<T> {
 
     pub fn image_transformed(&self) -> anyhow::Result<image::RgbaImage> {
         let mut image = image::DynamicImage::from(self.image()?);
-        image.apply_orientation(match self.transform {
-            wl_output::Transform::Normal => image::metadata::Orientation::NoTransforms,
-            wl_output::Transform::_90 => image::metadata::Orientation::Rotate90,
-            wl_output::Transform::_180 => image::metadata::Orientation::Rotate180,
-            wl_output::Transform::_270 => image::metadata::Orientation::Rotate270,
-            wl_output::Transform::Flipped => image::metadata::Orientation::FlipHorizontal,
-            wl_output::Transform::Flipped90 => image::metadata::Orientation::Rotate90FlipH,
-            wl_output::Transform::Flipped180 => image::metadata::Orientation::FlipVertical,
-            wl_output::Transform::Flipped270 => image::metadata::Orientation::Rotate270FlipH,
-            _ => unreachable!(),
-        });
+        image.apply_orientation(wl_transform_to_image_orientation(self.transform));
         match image {
             image::DynamicImage::ImageRgba8(image) => Ok(image),
             _ => unreachable!(),
@@ -716,6 +813,12 @@ impl ScreencopyHandler for AppData {
             session.update(|data| {
                 data.formats = Some(formats.clone());
             });
+        } else if let Some(data) = session.data::<CursorCaptureSessionData>() {
+            *data.formats.lock().unwrap() = Some(formats.clone());
+            let waker = data.waker.lock().unwrap();
+            if let Some(waker) = &*waker {
+                waker.wake_by_ref();
+            }
         }
     }
 
@@ -755,6 +858,66 @@ impl ScreencopyHandler for AppData {
             .and_then(|data| data.sender.lock().unwrap().take())
         {
             let _ = sender.send(Err(reason));
+        }
+    }
+
+    fn cursor_enter(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        session: &CaptureCursorSession,
+    ) {
+        let data = session.data::<CursorSessionData>().unwrap();
+        if let Some(session) = data.session.upgrade() {
+            session.cursor_entered.store(true, Ordering::Relaxed);
+        }
+    }
+
+    fn cursor_leave(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        session: &CaptureCursorSession,
+    ) {
+        let data = session.data::<CursorSessionData>().unwrap();
+        if let Some(session) = data.session.upgrade() {
+            session.cursor_entered.store(false, Ordering::Relaxed);
+        }
+    }
+
+    fn cursor_position(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        session: &CaptureCursorSession,
+        x: i32,
+        y: i32,
+    ) {
+        let data = session.data::<CursorSessionData>().unwrap();
+        if let Some(session) = data.session.upgrade() {
+            let mut value = [0; 8];
+            value[..4].copy_from_slice(&x.to_ne_bytes());
+            value[4..].copy_from_slice(&y.to_ne_bytes());
+            let value = u64::from_ne_bytes(value);
+            session.cursor_position.store(value, Ordering::Relaxed);
+        }
+    }
+
+    fn cursor_hotspot(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        session: &CaptureCursorSession,
+        x: i32,
+        y: i32,
+    ) {
+        let data = session.data::<CursorSessionData>().unwrap();
+        if let Some(session) = data.session.upgrade() {
+            let mut value = [0; 8];
+            value[..4].copy_from_slice(&x.to_ne_bytes());
+            value[4..].copy_from_slice(&y.to_ne_bytes());
+            let value = u64::from_ne_bytes(value);
+            session.cursor_hotspot.store(value, Ordering::Relaxed);
         }
     }
 }
@@ -806,6 +969,64 @@ impl DmabufHandler for AppData {
     }
 }
 
+impl SeatHandler for AppData {
+    fn seat_state(&mut self) -> &mut SeatState {
+        &mut self.seat_state
+    }
+
+    fn new_seat(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _seat: wl_seat::WlSeat) {}
+
+    fn new_capability(
+        &mut self,
+        _conn: &Connection,
+        qh: &QueueHandle<Self>,
+        seat: wl_seat::WlSeat,
+        capability: seat::Capability,
+    ) {
+        if capability == seat::Capability::Pointer {
+            let pointer = self.seat_state.get_pointer(qh, &seat).unwrap();
+            *self.wayland_helper.inner.pointer.lock().unwrap() = Some((seat, pointer));
+        }
+    }
+
+    fn remove_capability(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        seat: wl_seat::WlSeat,
+        capability: seat::Capability,
+    ) {
+        if capability == seat::Capability::Pointer {
+            self.wayland_helper
+                .inner
+                .pointer
+                .lock()
+                .unwrap()
+                .take_if(|(s, _)| *s == seat);
+        }
+    }
+
+    fn remove_seat(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, seat: wl_seat::WlSeat) {
+        self.wayland_helper
+            .inner
+            .pointer
+            .lock()
+            .unwrap()
+            .take_if(|(s, _)| *s == seat);
+    }
+}
+
+impl PointerHandler for AppData {
+    fn pointer_frame(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _pointer: &wl_pointer::WlPointer,
+        _events: &[PointerEvent],
+    ) {
+    }
+}
+
 impl Dispatch<wl_shm_pool::WlShmPool, ()> for AppData {
     fn event(
         _app_data: &mut Self,
@@ -841,6 +1062,29 @@ impl ScreencopySessionDataExt for SessionData {
     }
 }
 
+struct CursorSessionData {
+    session: Weak<CursorSessionInner>,
+    session_data: ScreencopyCursorSessionData,
+}
+
+impl ScreencopyCursorSessionDataExt for CursorSessionData {
+    fn screencopy_cursor_session_data(&self) -> &ScreencopyCursorSessionData {
+        &self.session_data
+    }
+}
+
+struct CursorCaptureSessionData {
+    session_data: ScreencopySessionData,
+    waker: Mutex<Option<std::task::Waker>>,
+    formats: Mutex<Option<Formats>>,
+}
+
+impl ScreencopySessionDataExt for CursorCaptureSessionData {
+    fn screencopy_session_data(&self) -> &ScreencopySessionData {
+        &self.session_data
+    }
+}
+
 struct FrameData {
     frame_data: ScreencopyFrameData,
     #[allow(clippy::type_complexity)]
@@ -857,4 +1101,6 @@ sctk::delegate_shm!(AppData);
 sctk::delegate_registry!(AppData);
 sctk::delegate_output!(AppData);
 sctk::delegate_dmabuf!(AppData);
+sctk::delegate_seat!(AppData);
+sctk::delegate_pointer!(AppData);
 cosmic_client_toolkit::delegate_screencopy!(AppData);
