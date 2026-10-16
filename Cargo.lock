@@ -8926,7 +8926,7 @@ dependencies = [
 
 [[package]]
 name = "wmde-files"
-version = "1.10.0"
+version = "1.10.2"
 dependencies = [
  "anyhow",
  "atomic_float",
